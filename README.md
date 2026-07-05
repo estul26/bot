@@ -1,76 +1,159 @@
 # Telegram Bot Template
 
-Reusable Go template for Telegram bots with MongoDB persistence, structured logging, Docker, and GitHub Actions.
+A reusable Go starter for Telegram bots. It gives you the boring-but-important foundation: Telegram long polling, MongoDB persistence, structured logging, Docker, local development setup, CI, and container release publishing.
 
-## What Is Included
+Use this repository when you want to start a new Telegram bot without rebuilding configuration, logging, database setup, user/group tracking, owner bootstrap, and basic health commands from scratch.
+
+## Features
 
 - Telegram long polling with `github.com/go-telegram/bot`.
-- Environment loading and validation with optional `.env` support in development.
-- Structured JSON logging with standard service/environment fields.
-- MongoDB client lifecycle, health checks, and base indexes.
-- User, group, and owner records in MongoDB.
-- Basic commands:
-  - `/start`
-  - `/help`
-  - `/ping`
-  - `/status` owner-only runtime status
-- Graceful shutdown on `SIGINT` and `SIGTERM`.
-- Local Docker Compose stack for MongoDB and the bot.
-- CI plus GHCR image release workflow.
+- MongoDB connection management, ping checks, and startup indexes.
+- Automatic user and group registration.
+- Owner bootstrap from `BOT_OWNER`.
+- Owner-only runtime status command.
+- Structured JSON logging with service and environment fields.
+- `.env` loading in development only.
+- `-config-only` mode for safe configuration checks.
+- Dockerfile and local Docker Compose stack.
+- GitHub Actions CI and GHCR image release workflow.
+
+## Built-In Bot Commands
+
+- `/start` shows a short welcome message and the caller role.
+- `/help` lists available commands.
+- `/ping` returns app environment, uptime, and MongoDB health.
+- `/status` returns user/group counts for the configured owner only.
+
+Any non-command private message receives a simple placeholder response. Replace that handler with your project-specific behavior.
+
+## Requirements
+
+- Go `1.26.4` or newer.
+- Docker and Docker Compose for the local MongoDB stack.
+- A Telegram bot token from BotFather.
+- A MongoDB database, either local or hosted.
+
+## Quick Start
+
+1. Create a new Telegram bot with BotFather and copy the token.
+2. Get your Telegram numeric user ID and use it as `BOT_OWNER`.
+3. Copy the example environment file:
+
+```sh
+cp .env.example .env
+```
+
+4. Edit `.env`:
+
+```env
+APP_ENV=development
+LOG_LEVEL=debug
+TELEGRAM_TOKEN=123:replace-me
+BOT_OWNER=123456789
+MONGO_URI=mongodb://localhost:27017
+MONGO_DB=telegram_bot_dev
+```
+
+5. Start MongoDB:
+
+```sh
+docker compose --env-file .env -f docker-compose.local.yml up -d mongo
+```
+
+6. Validate configuration without starting Telegram polling:
+
+```sh
+APP_ENV=development go run ./cmd/bot -config-only
+```
+
+7. Run the bot:
+
+```sh
+APP_ENV=development go run ./cmd/bot
+```
+
+8. Open Telegram and send your bot `/start`, `/ping`, and `/status`.
+
+## Run With Docker Compose
+
+To build and run both MongoDB and the bot locally:
+
+```sh
+docker compose --env-file .env -f docker-compose.local.yml up --build
+```
+
+To stop the stack:
+
+```sh
+docker compose --env-file .env -f docker-compose.local.yml down
+```
+
+To remove the local MongoDB volume too:
+
+```sh
+docker compose --env-file .env -f docker-compose.local.yml down -v
+```
 
 ## Configuration
 
 Required environment variables:
 
-- `TELEGRAM_TOKEN`
-- `BOT_OWNER`
-- `MONGO_URI`
-- `MONGO_DB`
+- `TELEGRAM_TOKEN`: Telegram bot token issued by BotFather.
+- `BOT_OWNER`: Numeric Telegram user ID with owner privileges.
+- `MONGO_URI`: MongoDB connection string.
+- `MONGO_DB`: MongoDB database name.
 
 Optional environment variables:
 
-- `APP_ENV` default `production`
-- `LOG_LEVEL` default `info`
+- `APP_ENV`: `development` or `production`; default `production`.
+- `LOG_LEVEL`: logrus level such as `debug`, `info`, `warn`, or `error`; default `info`.
 
 Recommended database names:
 
-- Production: `telegram_bot`
 - Development: `telegram_bot_dev`
+- Production: `telegram_bot`
 
-## Local Development
-
-1. Copy the local template: `cp .env.example .env`
-2. Replace placeholder values in `.env`.
-3. Validate Compose config: `docker compose --env-file .env -f docker-compose.local.yml config`
-4. Start MongoDB: `docker compose --env-file .env -f docker-compose.local.yml up -d mongo`
-5. Check config without starting polling: `APP_ENV=development go run ./cmd/bot -config-only`
-6. Run the bot locally: `APP_ENV=development go run ./cmd/bot`
-
-To run the bot in Docker too:
-
-```sh
-docker compose --env-file .env -f docker-compose.local.yml up --build bot
-```
+The app loads `.env` only when `APP_ENV=development`. Production should provide environment variables through the runtime.
 
 ## Project Structure
 
-- `cmd/bot`: process bootstrap, dependency wiring, and graceful shutdown.
+- `cmd/bot`: application entrypoint, dependency wiring, startup, and graceful shutdown.
 - `internal/config`: environment contract, dotenv loading, validation, and redacted config output.
 - `internal/logging`: logrus setup and contextual logging helpers.
-- `internal/store`: MongoDB manager, base collection helpers, indexes, and counts.
+- `internal/store`: MongoDB manager, base collection helpers, indexes, pings, and counts.
 - `internal/domain`: user/group models and role helpers.
-- `internal/feature`: reusable user, group, and owner registration helpers.
-- `internal/telegram`: Telegram client, routing, basic commands, and placeholder message handling.
+- `internal/feature/user`: user registration and last-seen tracking.
+- `internal/feature/group`: group registration and last-seen tracking.
+- `internal/feature/owner`: owner bootstrap and previous-owner demotion.
+- `internal/telegram`: Telegram client, router, commands, and placeholder message handler.
 
-## Extending The Template
+## How To Build Your Bot
 
-- Add domain features under `internal/feature/<name>` or a new package under `internal`.
-- Wire new services in `cmd/bot/main.go`.
-- Register new Telegram commands in `internal/telegram`.
-- Keep external dependencies behind small interfaces so handlers remain easy to test.
-- Update `.env.example`, README, and tests when adding new required configuration.
+1. Rename generic project identifiers if needed:
+   - Go module in `go.mod`.
+   - Docker image/container names in `docker-compose.local.yml`.
+   - Logger `serviceName` in `internal/logging/logging.go`.
+2. Add your domain logic under `internal/feature/<name>` or another package under `internal`.
+3. Keep external APIs behind interfaces so handlers remain testable.
+4. Wire new services in `cmd/bot/main.go`.
+5. Register commands or message behavior in `internal/telegram/telegram.go`.
+6. Add tests beside the package you changed.
+7. Update `.env.example` and this README when adding required config.
+
+The default private-message behavior lives in `genericMessageHandler`. That is the easiest place to start if your bot should respond to normal text messages.
+
+## Database Collections
+
+The template creates and indexes:
+
+- `users`: `user_id`, `role`, `created_at`, `updated_at`, `last_seen_at`.
+- `groups`: `chat_id`, `title`, `joined_at`, `last_seen_at`.
+
+Startup ensures unique indexes on `users.user_id` and `groups.chat_id`.
 
 ## Checks
+
+Run these before pushing changes:
 
 ```sh
 go fmt ./...
@@ -79,3 +162,17 @@ go test ./...
 go vet ./...
 go build ./cmd/bot
 ```
+
+For extra confidence:
+
+```sh
+go test -race ./...
+docker compose --env-file .env.example -f docker-compose.local.yml config
+```
+
+## GitHub Actions
+
+- `ci.yml` runs formatting, tidy checks, vet, tests, race tests, vulnerability scanning, and build.
+- `release.yml` builds and pushes a Docker image to GHCR after CI succeeds.
+
+The release workflow tags images with the commit SHA, plus `main` and `latest` on the `main` branch.
