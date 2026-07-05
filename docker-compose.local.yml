@@ -1,0 +1,39 @@
+services:
+  mongo:
+    image: mongo:6.0
+    container_name: bot-mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      MONGO_INITDB_DATABASE: telegram_bot_dev
+    command: ["--bind_ip", "0.0.0.0"]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand({ ping: 1 })"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  bot:
+    image: bot:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bot
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      APP_ENV: development
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      TELEGRAM_TOKEN: ${TELEGRAM_TOKEN:?TELEGRAM_TOKEN is required}
+      BOT_OWNER: ${BOT_OWNER:?BOT_OWNER is required}
+      MONGO_URI: mongodb://mongo:27017
+      MONGO_DB: ${MONGO_DB:-telegram_bot_dev}
+
+volumes:
+  mongo_data:

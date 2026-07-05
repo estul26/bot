@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - "v*"
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.4"
+          check-latest: true
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Verify module files are tidy
+        run: |
+          go mod tidy
+          if ! git diff --quiet -- go.mod go.sum; then
+            echo "go.mod/go.sum are not tidy. Run 'go mod tidy' locally."
+            git diff -- go.mod go.sum
+            exit 1
+          fi
+
+      - name: Go fmt (fail on diff)
+        run: |
+          go fmt ./...
+          if ! git diff --quiet; then
+            echo "Go files are not formatted. Run 'go fmt ./...' locally."
+            git diff --stat
+            exit 1
+          fi
+
+      - name: Run vet
+        run: |
+          set -eo pipefail
+          mkdir -p artifacts
+          go vet ./... 2>&1 | tee artifacts/go-vet.log
+
+      - name: Run tests
+        run: |
+          set -eo pipefail
+          mkdir -p artifacts
+          go test ./... 2>&1 | tee artifacts/go-test.log
+
+      - name: Run race tests
+        run: |
+          set -eo pipefail
+          mkdir -p artifacts
+          go test -race ./... 2>&1 | tee artifacts/go-test-race.log
+
+      - name: Run govulncheck
+        run: |
+          set -eo pipefail
+          mkdir -p artifacts
+          go run golang.org/x/vuln/cmd/govulncheck@v1.3.0 ./... 2>&1 | tee artifacts/govulncheck.log
+
+      - name: Build bot binary
+        run: go build ./cmd/bot
+
+      - name: Upload check logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-check-logs
+          path: artifacts/*.log
+          if-no-files-found: warn
