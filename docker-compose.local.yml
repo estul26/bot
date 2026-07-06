@@ -1,6 +1,6 @@
 services:
   mongo:
-    image: mongo:6.0
+    image: mongo:8.3.4
     container_name: bot-mongo
     restart: unless-stopped
     ports:

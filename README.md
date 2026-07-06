@@ -94,6 +94,11 @@ To remove the local MongoDB volume too:
 docker compose --env-file .env -f docker-compose.local.yml down -v
 ```
 
+The local Compose stack uses MongoDB 8.3.4. If you already have a `mongo_data`
+volume created by an older major version such as MongoDB 6.0, either recreate
+the volume for disposable development data or follow MongoDB's supported upgrade
+path before reusing existing data.
+
 ## Configuration
 
 Required environment variables:
