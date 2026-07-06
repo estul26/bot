@@ -6,10 +6,10 @@ import (
 	"testing"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.mongodb.org/mongo-driver/mongo/readpref"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 
 	"bot/internal/config"
 )
@@ -264,7 +264,7 @@ type fakeMongoClient struct {
 func newFakeMongoClient(t *testing.T) *fakeMongoClient {
 	t.Helper()
 
-	client, err := mongo.NewClient(options.Client().ApplyURI("mongodb://example.com:27017"))
+	client, err := mongo.Connect(options.Client().ApplyURI("mongodb://example.com:27017"))
 	if err != nil {
 		t.Fatalf("failed to build fake client: %v", err)
 	}
@@ -280,7 +280,7 @@ func (f *fakeMongoClient) Ping(_ context.Context, rp *readpref.ReadPref) error {
 	return f.pingErr
 }
 
-func (f *fakeMongoClient) Database(name string, opts ...*options.DatabaseOptions) *mongo.Database {
+func (f *fakeMongoClient) Database(name string, opts ...options.Lister[options.DatabaseOptions]) *mongo.Database {
 	f.databaseRequests = append(f.databaseRequests, name)
 	return f.client.Database(name, opts...)
 }
@@ -343,7 +343,8 @@ func assertIndexModel(t *testing.T, models []mongo.IndexModel, name string, expe
 	t.Helper()
 
 	for _, model := range models {
-		if model.Options == nil || model.Options.Name == nil || *model.Options.Name != name {
+		indexOptions := resolveIndexOptions(t, model.Options)
+		if indexOptions.Name == nil || *indexOptions.Name != name {
 			continue
 		}
 
@@ -361,10 +362,10 @@ func assertIndexModel(t *testing.T, models []mongo.IndexModel, name string, expe
 		}
 
 		if unique {
-			if model.Options.Unique == nil || !*model.Options.Unique {
+			if indexOptions.Unique == nil || !*indexOptions.Unique {
 				t.Fatalf("expected unique=true for index %s", name)
 			}
-		} else if model.Options.Unique != nil && *model.Options.Unique {
+		} else if indexOptions.Unique != nil && *indexOptions.Unique {
 			t.Fatalf("expected unique=false for index %s", name)
 		}
 
@@ -372,4 +373,19 @@ func assertIndexModel(t *testing.T, models []mongo.IndexModel, name string, expe
 	}
 
 	t.Fatalf("expected index %s to be present", name)
+}
+
+func resolveIndexOptions(t *testing.T, builder options.Lister[options.IndexOptions]) options.IndexOptions {
+	t.Helper()
+	if builder == nil {
+		return options.IndexOptions{}
+	}
+
+	resolved := options.IndexOptions{}
+	for _, setter := range builder.List() {
+		if err := setter(&resolved); err != nil {
+			t.Fatalf("failed to resolve index options: %v", err)
+		}
+	}
+	return resolved
 }

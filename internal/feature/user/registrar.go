@@ -8,16 +8,16 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"bot/internal/domain"
 	"bot/internal/logging"
 )
 
 type userCollection interface {
-	UpdateOne(ctx context.Context, filter interface{}, update interface{}, opts ...*options.UpdateOptions) (*mongo.UpdateResult, error)
+	UpdateOne(ctx context.Context, filter interface{}, update interface{}, opts ...options.Lister[options.UpdateOneOptions]) (*mongo.UpdateResult, error)
 }
 
 // Registrar ensures users are present in the database and keeps their
@@ -68,7 +68,7 @@ func (r *Registrar) EnsureUser(ctx context.Context, userID int64) (bool, error) 
 	result, err := r.users.UpdateOne(ctx,
 		bson.M{"user_id": userID},
 		update,
-		options.Update().SetUpsert(true),
+		options.UpdateOne().SetUpsert(true),
 	)
 	if err != nil {
 		return false, fmt.Errorf("ensure user: %w", err)

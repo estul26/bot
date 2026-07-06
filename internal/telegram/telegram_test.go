@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -19,10 +20,18 @@ import (
 
 type fakeBot struct {
 	startedWith context.Context
+	getMeUser   *models.User
+	getMeErr    error
+	getMeCalls  int
 }
 
 func (f *fakeBot) Start(ctx context.Context) {
 	f.startedWith = ctx
+}
+
+func (f *fakeBot) GetMe(ctx context.Context) (*models.User, error) {
+	f.getMeCalls++
+	return f.getMeUser, f.getMeErr
 }
 
 func TestNewClientCreatesBot(t *testing.T) {
@@ -31,7 +40,7 @@ func TestNewClientCreatesBot(t *testing.T) {
 
 	var gotToken string
 	var gotOptions []bot.Option
-	runner := &fakeBot{}
+	runner := &fakeBot{getMeUser: &models.User{Username: "template_bot"}}
 
 	createBot = func(token string, options ...bot.Option) (botRunner, error) {
 		gotToken = token
@@ -56,6 +65,9 @@ func TestNewClientCreatesBot(t *testing.T) {
 	if len(gotOptions) != 3 {
 		t.Fatalf("expected 3 bot options, got %d", len(gotOptions))
 	}
+	if runner.getMeCalls != 1 {
+		t.Fatalf("expected bot username lookup to run once, got %d", runner.getMeCalls)
+	}
 }
 
 func TestNewClientRequiresToken(t *testing.T) {
@@ -77,6 +89,37 @@ func TestNewClientPropagatesBotError(t *testing.T) {
 	_, err := NewClient(config.Config{TelegramToken: "token"}, nil)
 	if !errors.Is(err, expected) {
 		t.Fatalf("expected error %v, got %v", expected, err)
+	}
+}
+
+func TestNewClientContinuesWhenBotUsernameLookupFails(t *testing.T) {
+	origCreateBot := createBot
+	defer func() { createBot = origCreateBot }()
+
+	expected := errors.New("get me failed")
+	runner := &fakeBot{getMeErr: expected}
+	createBot = func(string, ...bot.Option) (botRunner, error) {
+		return runner, nil
+	}
+
+	hookLogger, hook := logtest.NewNullLogger()
+	client, err := NewClient(config.Config{TelegramToken: "token"}, logrus.NewEntry(hookLogger))
+	if err != nil {
+		t.Fatalf("expected NewClient to continue after username lookup failure, got %v", err)
+	}
+	if client == nil {
+		t.Fatalf("expected client")
+	}
+	if runner.getMeCalls != 1 {
+		t.Fatalf("expected one username lookup, got %d", runner.getMeCalls)
+	}
+
+	entry := findLogEvent(hook.AllEntries(), "telegram_identity_lookup_failed")
+	if entry == nil {
+		t.Fatalf("expected username lookup failure warning")
+	}
+	if entry.Level != logrus.WarnLevel {
+		t.Fatalf("expected warning level, got %s", entry.Level)
 	}
 }
 
@@ -103,6 +146,24 @@ func TestClientStartLogsAndUsesContext(t *testing.T) {
 	}
 	if entries[1].Data["event"] != "telegram_stopped" {
 		t.Fatalf("expected stop log event, got %v", entries[1].Data["event"])
+	}
+}
+
+func TestCacheBotUsernameStoresSuccessfulLookup(t *testing.T) {
+	hookLogger, hook := logtest.NewNullLogger()
+	identity := &botIdentity{}
+	runner := &fakeBot{getMeUser: &models.User{Username: "@Template_Bot"}}
+
+	cacheBotUsername(logrus.NewEntry(hookLogger), runner, identity)
+
+	if runner.getMeCalls != 1 {
+		t.Fatalf("expected one username lookup, got %d", runner.getMeCalls)
+	}
+	if identity.Username() != "template_bot" {
+		t.Fatalf("expected normalized username, got %q", identity.Username())
+	}
+	if findLogEvent(hook.AllEntries(), "telegram_identity_cached") == nil {
+		t.Fatalf("expected identity cached log")
 	}
 }
 
@@ -233,6 +294,37 @@ func TestDefaultHandlerRegistersUserAndGroup(t *testing.T) {
 	}
 }
 
+func TestDefaultHandlerRedactsMessageTextFromLogs(t *testing.T) {
+	hookLogger, hook := logtest.NewNullLogger()
+	handler := defaultHandler(logrus.NewEntry(hookLogger), nil, nil, 1, commandDiagnostics{})
+
+	secret := "please keep this private"
+	fullText := "/missing " + secret
+	handler(context.Background(), nil, privateTextUpdate(42, 42, fullText))
+
+	entries := hook.AllEntries()
+	if len(entries) == 0 {
+		t.Fatalf("expected log entries")
+	}
+
+	sawTextMetadata := false
+	for _, entry := range entries {
+		if _, ok := entry.Data["text"]; ok {
+			t.Fatalf("expected no raw text field in log entry %q: %v", entry.Message, entry.Data)
+		}
+		if containsLogValue(entry, secret) || containsLogValue(entry, fullText) {
+			t.Fatalf("expected log entry to redact message text, got %q: %v", entry.Message, entry.Data)
+		}
+		if entry.Data["has_text"] == true && entry.Data["text_length"] == len([]rune(fullText)) {
+			sawTextMetadata = true
+		}
+	}
+
+	if !sawTextMetadata {
+		t.Fatalf("expected derived text metadata in at least one log entry")
+	}
+}
+
 func TestRouterRoutesCommandsAndGenericMessages(t *testing.T) {
 	logger := logrus.New()
 	logger.SetOutput(io.Discard)
@@ -257,6 +349,48 @@ func TestRouterRoutesCommandsAndGenericMessages(t *testing.T) {
 				t.Fatalf("expected route %s, got %s", tt.want, got)
 			}
 		})
+	}
+}
+
+func TestRouterFiltersGroupCommandMentions(t *testing.T) {
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	router := newMessageRouter(logrus.NewEntry(logger), 1, commandDiagnostics{botUsername: "template_bot"})
+
+	tests := []struct {
+		name string
+		text string
+		want string
+	}{
+		{name: "unmentioned command", text: "/help", want: "command_help"},
+		{name: "own mention", text: "/help@Template_Bot", want: "command_help"},
+		{name: "foreign mention", text: "/help@OtherBot", want: "command_ignored_foreign_mention"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			update := groupTextUpdate(42, -100, tt.text)
+			got := router.route(context.Background(), nil, update, extractUpdateMeta(update))
+			if got != tt.want {
+				t.Fatalf("expected route %s, got %s", tt.want, got)
+			}
+		})
+	}
+}
+
+func TestRouterHandlesUnmentionedGroupCommandsWithoutCachedUsername(t *testing.T) {
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	router := newMessageRouter(logrus.NewEntry(logger), 1, commandDiagnostics{})
+
+	unmentioned := groupTextUpdate(42, -100, "/help")
+	if got := router.route(context.Background(), nil, unmentioned, extractUpdateMeta(unmentioned)); got != "command_help" {
+		t.Fatalf("expected unmentioned command to route without cached username, got %s", got)
+	}
+
+	mentioned := groupTextUpdate(42, -100, "/help@template_bot")
+	if got := router.route(context.Background(), nil, mentioned, extractUpdateMeta(mentioned)); got != "command_ignored_foreign_mention" {
+		t.Fatalf("expected mentioned command to be ignored without cached username, got %s", got)
 	}
 }
 
@@ -355,6 +489,17 @@ func privateTextUpdate(userID, chatID int64, text string) *models.Update {
 	}
 }
 
+func groupTextUpdate(userID, chatID int64, text string) *models.Update {
+	return &models.Update{
+		Message: &models.Message{
+			From: &models.User{ID: userID},
+			Chat: models.Chat{ID: chatID, Type: models.ChatTypeSupergroup, Title: "Team"},
+			Date: 1700000000,
+			Text: text,
+		},
+	}
+}
+
 func newTestBot(t *testing.T) *bot.Bot {
 	t.Helper()
 	return new(bot.Bot)
@@ -427,4 +572,22 @@ func (s *stubStatsProvider) CountUsers(context.Context) (int64, error) {
 
 func (s *stubStatsProvider) CountGroups(context.Context) (int64, error) {
 	return s.groups, s.err
+}
+
+func containsLogValue(entry *logrus.Entry, needle string) bool {
+	for _, value := range entry.Data {
+		if strings.Contains(fmt.Sprint(value), needle) {
+			return true
+		}
+	}
+	return strings.Contains(entry.Message, needle)
+}
+
+func findLogEvent(entries []*logrus.Entry, event string) *logrus.Entry {
+	for _, entry := range entries {
+		if entry.Data["event"] == event {
+			return entry
+		}
+	}
+	return nil
 }

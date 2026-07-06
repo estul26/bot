@@ -7,9 +7,9 @@ import (
 
 	"github.com/sirupsen/logrus"
 	logtest "github.com/sirupsen/logrus/hooks/test"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 func TestEnsureGroupCreatesNewRecord(t *testing.T) {
@@ -89,7 +89,7 @@ func newFakeGroupCollection(t *testing.T) *fakeGroupCollection {
 	}
 }
 
-func (f *fakeGroupCollection) UpdateOne(_ context.Context, filter interface{}, update interface{}, opts ...*options.UpdateOptions) (*mongo.UpdateResult, error) {
+func (f *fakeGroupCollection) UpdateOne(_ context.Context, filter interface{}, update interface{}, opts ...options.Lister[options.UpdateOneOptions]) (*mongo.UpdateResult, error) {
 	filterDoc, ok := filter.(bson.M)
 	if !ok {
 		return nil, f.Errorf("unexpected filter type %T", filter)
@@ -105,7 +105,7 @@ func (f *fakeGroupCollection) UpdateOne(_ context.Context, filter interface{}, u
 	setDoc, _ := updateDoc["$set"].(bson.M)
 	setOnInsertDoc, _ := updateDoc["$setOnInsert"].(bson.M)
 
-	upsert := len(opts) > 0 && opts[0] != nil && opts[0].Upsert != nil && *opts[0].Upsert
+	upsert := updateOneUpsert(f.t, opts)
 
 	doc, found := f.docs[chatID]
 	if !found && !upsert {
@@ -134,6 +134,24 @@ func (f *fakeGroupCollection) UpdateOne(_ context.Context, filter interface{}, u
 	}
 
 	return result, nil
+}
+
+func updateOneUpsert(t *testing.T, opts []options.Lister[options.UpdateOneOptions]) bool {
+	t.Helper()
+
+	resolved := options.UpdateOneOptions{}
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		for _, setter := range opt.List() {
+			if err := setter(&resolved); err != nil {
+				t.Fatalf("failed to resolve update options: %v", err)
+			}
+		}
+	}
+
+	return resolved.Upsert != nil && *resolved.Upsert
 }
 
 func (f *fakeGroupCollection) docFor(t *testing.T, chatID int64) bson.M {

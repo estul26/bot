@@ -6,10 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 func TestUserRepositoryCreateAndGet(t *testing.T) {
@@ -147,7 +146,7 @@ func newFakeInsertFindCollection(t *testing.T) *fakeInsertFindCollection {
 	}
 }
 
-func (f *fakeInsertFindCollection) InsertOne(ctx context.Context, document interface{}, opts ...*options.InsertOneOptions) (*mongo.InsertOneResult, error) {
+func (f *fakeInsertFindCollection) InsertOne(ctx context.Context, document interface{}, opts ...options.Lister[options.InsertOneOptions]) (*mongo.InsertOneResult, error) {
 	doc := marshalDoc(f.t, document)
 	keyName, keyVal := idField(doc)
 	if keyName == "" {
@@ -158,7 +157,7 @@ func (f *fakeInsertFindCollection) InsertOne(ctx context.Context, document inter
 	return &mongo.InsertOneResult{InsertedID: keyVal}, nil
 }
 
-func (f *fakeInsertFindCollection) FindOne(ctx context.Context, filter interface{}, opts ...*options.FindOneOptions) *mongo.SingleResult {
+func (f *fakeInsertFindCollection) FindOne(ctx context.Context, filter interface{}, opts ...options.Lister[options.FindOneOptions]) *mongo.SingleResult {
 	filterDoc, ok := filter.(bson.M)
 	if !ok {
 		return mongo.NewSingleResultFromDocument(nil, fmt.Errorf("unexpected filter type %T", filter), nil)
@@ -268,7 +267,7 @@ func parseTime(t *testing.T, value interface{}) time.Time {
 	t.Helper()
 
 	switch v := value.(type) {
-	case primitive.DateTime:
+	case bson.DateTime:
 		return v.Time()
 	case time.Time:
 		return v

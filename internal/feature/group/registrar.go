@@ -9,15 +9,15 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"bot/internal/logging"
 )
 
 type groupCollection interface {
-	UpdateOne(ctx context.Context, filter interface{}, update interface{}, opts ...*options.UpdateOptions) (*mongo.UpdateResult, error)
+	UpdateOne(ctx context.Context, filter interface{}, update interface{}, opts ...options.Lister[options.UpdateOneOptions]) (*mongo.UpdateResult, error)
 }
 
 // Registrar ensures groups are persisted when the bot encounters them and keeps
@@ -71,7 +71,7 @@ func (r *Registrar) EnsureGroup(ctx context.Context, chatID int64, title string)
 	result, err := r.groups.UpdateOne(ctx,
 		bson.M{"chat_id": chatID},
 		update,
-		options.Update().SetUpsert(true),
+		options.UpdateOne().SetUpsert(true),
 	)
 	if err != nil {
 		return false, fmt.Errorf("ensure group: %w", err)

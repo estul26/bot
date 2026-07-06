@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -21,12 +22,14 @@ import (
 
 type botRunner interface {
 	Start(ctx context.Context)
+	GetMe(ctx context.Context) (*models.User, error)
 }
 
 const (
 	pingMongoTimeout    = 2 * time.Second
 	statusLookupTimeout = 2 * time.Second
 	statusCountTimeout  = 2 * time.Second
+	botIdentityTimeout  = 2 * time.Second
 )
 
 var (
@@ -75,6 +78,8 @@ type StatsProvider interface {
 type commandDiagnostics struct {
 	appEnv        string
 	processStart  time.Time
+	botUsername   string
+	botUsernameFn func() string
 	mongoChecker  MongoChecker
 	userFetcher   UserFetcher
 	statsProvider StatsProvider
@@ -87,6 +92,11 @@ type clientOptions struct {
 	processStart   time.Time
 	userFetcher    UserFetcher
 	statsProvider  StatsProvider
+}
+
+type botIdentity struct {
+	mu       sync.RWMutex
+	username string
 }
 
 // ClientOption configures optional Telegram client dependencies.
@@ -156,9 +166,11 @@ func NewClient(cfg config.Config, logger *logrus.Entry, opts ...ClientOption) (*
 		}
 	}
 
+	identity := &botIdentity{}
 	diag := normalizeDiagnostics(commandDiagnostics{
 		appEnv:        cfg.AppEnv,
 		processStart:  clientOpts.processStart,
+		botUsernameFn: identity.Username,
 		mongoChecker:  clientOpts.mongoChecker,
 		userFetcher:   clientOpts.userFetcher,
 		statsProvider: clientOpts.statsProvider,
@@ -172,6 +184,8 @@ func NewClient(cfg config.Config, logger *logrus.Entry, opts ...ClientOption) (*
 	if err != nil {
 		return nil, fmt.Errorf("init telegram bot client: %w", err)
 	}
+
+	cacheBotUsername(logger, tgBot, identity)
 
 	return &Client{
 		bot:    tgBot,
@@ -212,6 +226,7 @@ type registeredHandler struct {
 
 type messageRouter struct {
 	logger          *logrus.Entry
+	botUsername     func() string
 	commandHandlers map[string]registeredHandler
 	unknownHandler  registeredHandler
 	genericHandler  registeredHandler
@@ -227,9 +242,69 @@ func normalizeDiagnostics(diag commandDiagnostics) commandDiagnostics {
 	return diag
 }
 
+func (d commandDiagnostics) resolvedBotUsername() string {
+	if d.botUsernameFn != nil {
+		if username := normalizeBotUsername(d.botUsernameFn()); username != "" {
+			return username
+		}
+	}
+	return normalizeBotUsername(d.botUsername)
+}
+
+func (i *botIdentity) SetUsername(username string) {
+	if i == nil {
+		return
+	}
+
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.username = normalizeBotUsername(username)
+}
+
+func (i *botIdentity) Username() string {
+	if i == nil {
+		return ""
+	}
+
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.username
+}
+
+func cacheBotUsername(logger *logrus.Entry, runner botRunner, identity *botIdentity) {
+	if logger == nil {
+		logger = logging.Logger()
+	}
+	if runner == nil || identity == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), botIdentityTimeout)
+	defer cancel()
+
+	me, err := runner.GetMe(ctx)
+	if err != nil {
+		logger.WithField("event", "telegram_identity_lookup_failed").WithError(err).Warn("failed to cache telegram bot username")
+		return
+	}
+	if me == nil || strings.TrimSpace(me.Username) == "" {
+		logger.WithField("event", "telegram_identity_missing_username").Warn("telegram bot identity did not include username")
+		return
+	}
+
+	identity.SetUsername(me.Username)
+	logger.WithFields(logging.Fields{
+		"event":        "telegram_identity_cached",
+		"bot_username": identity.Username(),
+	}).Info("cached telegram bot username")
+}
+
 func newMessageRouter(logger *logrus.Entry, botOwnerID int64, diag commandDiagnostics) *messageRouter {
+	diag = normalizeDiagnostics(diag)
+
 	return &messageRouter{
-		logger: logger,
+		logger:      logger,
+		botUsername: diag.resolvedBotUsername,
 		commandHandlers: map[string]registeredHandler{
 			"start": {
 				name:    "command_start",
@@ -268,7 +343,12 @@ func (r *messageRouter) route(ctx context.Context, b *bot.Bot, update *models.Up
 	normalizedChatType := normalizeChatType(meta.chatType)
 
 	if isCommand(meta.text) {
-		cmd := commandName(meta.text)
+		cmd, mention, _ := splitCommandTarget(meta.text)
+		if shouldIgnoreCommandMention(normalizedChatType, mention, r.resolvedBotUsername()) {
+			r.logIgnoredMention(meta, normalizedChatType, cmd, mention)
+			return "command_ignored_foreign_mention"
+		}
+
 		target, ok := r.commandHandlers[cmd]
 		if !ok {
 			target = r.unknownHandler
@@ -282,6 +362,13 @@ func (r *messageRouter) route(ctx context.Context, b *bot.Bot, update *models.Up
 	r.logRoute(meta, normalizedChatType, r.genericHandler.name, "message", "")
 	r.genericHandler.handler(ctx, b, update)
 	return r.genericHandler.name
+}
+
+func (r *messageRouter) resolvedBotUsername() string {
+	if r == nil || r.botUsername == nil {
+		return ""
+	}
+	return normalizeBotUsername(r.botUsername())
 }
 
 func (r *messageRouter) logRoute(meta updateMeta, chatType, handlerName, route, command string) {
@@ -303,6 +390,27 @@ func (r *messageRouter) logRoute(meta updateMeta, chatType, handlerName, route, 
 	}
 
 	r.logger.WithFields(fields).Info("routed update")
+}
+
+func (r *messageRouter) logIgnoredMention(meta updateMeta, chatType, command, mention string) {
+	fields := logging.Fields{
+		"event":       "telegram_command_ignored",
+		"handler":     "command_ignored_foreign_mention",
+		"reason":      "foreign_bot_mention",
+		"route":       "command",
+		"chat_type":   chatType,
+		"command":     command,
+		"bot_mention": normalizeBotUsername(mention),
+	}
+
+	if meta.userID != 0 {
+		fields["user_id"] = meta.userID
+	}
+	if meta.chatID != 0 {
+		fields["chat_id"] = meta.chatID
+	}
+
+	r.logger.WithFields(fields).Info("ignored command addressed to another bot")
 }
 
 func defaultHandler(logger *logrus.Entry, userRegistrar UserRegistrar, groupRegistrar GroupRegistrar, botOwnerID int64, diag commandDiagnostics) bot.HandlerFunc {
@@ -357,8 +465,9 @@ func defaultHandler(logger *logrus.Entry, userRegistrar UserRegistrar, groupRegi
 			"update_ts":   updateTime.Format(time.RFC3339Nano),
 		}
 
-		if meta.text != "" {
-			fields["text"] = meta.text
+		addTextMetadata(fields, meta.text)
+		if cmd := commandName(meta.text); cmd != "" {
+			fields["command"] = cmd
 		}
 		if meta.userID != 0 {
 			fields["user_id"] = meta.userID
@@ -512,14 +621,19 @@ func isCommand(text string) bool {
 }
 
 func commandName(text string) string {
-	name, _ := splitCommandText(text)
+	name, _, _ := splitCommandTarget(text)
 	return name
 }
 
 func splitCommandText(text string) (string, string) {
+	command, _, args := splitCommandTarget(text)
+	return command, args
+}
+
+func splitCommandTarget(text string) (string, string, string) {
 	trimmed := strings.TrimSpace(text)
 	if !strings.HasPrefix(trimmed, "/") {
-		return "", trimmed
+		return "", "", trimmed
 	}
 
 	withoutSlash := strings.TrimPrefix(trimmed, "/")
@@ -534,11 +648,30 @@ func splitCommandText(text string) (string, string) {
 	}
 
 	command = strings.ToLower(strings.TrimSpace(command))
+	mention := ""
 	if base, _, ok := strings.Cut(command, "@"); ok {
+		mention = strings.TrimPrefix(strings.TrimSpace(command[strings.Index(command, "@"):]), "@")
 		command = base
 	}
 
-	return command, strings.TrimSpace(args)
+	return command, normalizeBotUsername(mention), strings.TrimSpace(args)
+}
+
+func shouldIgnoreCommandMention(chatType, mention, botUsername string) bool {
+	if normalizeChatType(chatType) != "group" || strings.TrimSpace(mention) == "" {
+		return false
+	}
+
+	normalizedBotUsername := normalizeBotUsername(botUsername)
+	if normalizedBotUsername == "" {
+		return true
+	}
+
+	return normalizeBotUsername(mention) != normalizedBotUsername
+}
+
+func normalizeBotUsername(username string) string {
+	return strings.ToLower(strings.TrimPrefix(strings.TrimSpace(username), "@"))
 }
 
 func primaryMessage(update *models.Update) *models.Message {
@@ -561,17 +694,23 @@ func logCommandHandled(logger *logrus.Entry, handlerName string, meta updateMeta
 		"chat_type": normalizeChatType(meta.chatType),
 	}
 
+	addTextMetadata(fields, meta.text)
+	if cmd := commandName(meta.text); cmd != "" {
+		fields["command"] = cmd
+	}
 	if meta.userID != 0 {
 		fields["user_id"] = meta.userID
 	}
 	if meta.chatID != 0 {
 		fields["chat_id"] = meta.chatID
 	}
-	if meta.text != "" {
-		fields["text"] = meta.text
-	}
 
 	logger.WithFields(fields).Info("handled command")
+}
+
+func addTextMetadata(fields logging.Fields, text string) {
+	fields["has_text"] = text != ""
+	fields["text_length"] = len([]rune(text))
 }
 
 func startCommandHandler(logger *logrus.Entry, botOwnerID int64) bot.HandlerFunc {

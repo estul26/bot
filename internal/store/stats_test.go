@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 func TestStatsProviderCountsUsersAndGroups(t *testing.T) {
@@ -82,7 +82,7 @@ type stubCountCollection struct {
 	calls int
 }
 
-func (s *stubCountCollection) CountDocuments(ctx context.Context, filter interface{}, opts ...*options.CountOptions) (int64, error) {
+func (s *stubCountCollection) CountDocuments(ctx context.Context, filter interface{}, opts ...options.Lister[options.CountOptions]) (int64, error) {
 	s.calls++
 	return s.count, s.err
 }

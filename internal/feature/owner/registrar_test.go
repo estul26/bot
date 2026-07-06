@@ -9,9 +9,9 @@ import (
 
 	"github.com/sirupsen/logrus"
 	logtest "github.com/sirupsen/logrus/hooks/test"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"bot/internal/domain"
 )
@@ -102,7 +102,7 @@ func TestEnsureOwnerDemotesPreviousAndUpsertsConfiguredOwner(t *testing.T) {
 		t.Fatalf("expected created_at timestamp on insert, got %v", setOnInsert["created_at"])
 	}
 
-	if len(upsertCall.opts) != 1 || upsertCall.opts[0].Upsert == nil || !*upsertCall.opts[0].Upsert {
+	if !updateOneUpsert(t, upsertCall.opts) {
 		t.Fatalf("expected upsert option to be enabled, got %v", upsertCall.opts)
 	}
 
@@ -197,7 +197,7 @@ type updateManyCall struct {
 type updateOneCall struct {
 	filter interface{}
 	update interface{}
-	opts   []*options.UpdateOptions
+	opts   []options.Lister[options.UpdateOneOptions]
 }
 
 type fakeUsers struct {
@@ -209,14 +209,32 @@ type fakeUsers struct {
 	updateOneResult  *mongo.UpdateResult
 }
 
-func (f *fakeUsers) UpdateMany(ctx context.Context, filter interface{}, update interface{}, opts ...*options.UpdateOptions) (*mongo.UpdateResult, error) {
+func (f *fakeUsers) UpdateMany(ctx context.Context, filter interface{}, update interface{}, opts ...options.Lister[options.UpdateManyOptions]) (*mongo.UpdateResult, error) {
 	f.updateManyCalls = append(f.updateManyCalls, updateManyCall{filter: filter, update: update})
 	return f.updateManyResult, f.updateManyErr
 }
 
-func (f *fakeUsers) UpdateOne(ctx context.Context, filter interface{}, update interface{}, opts ...*options.UpdateOptions) (*mongo.UpdateResult, error) {
+func (f *fakeUsers) UpdateOne(ctx context.Context, filter interface{}, update interface{}, opts ...options.Lister[options.UpdateOneOptions]) (*mongo.UpdateResult, error) {
 	f.updateOneCalls = append(f.updateOneCalls, updateOneCall{filter: filter, update: update, opts: opts})
 	return f.updateOneResult, f.updateOneErr
+}
+
+func updateOneUpsert(t *testing.T, opts []options.Lister[options.UpdateOneOptions]) bool {
+	t.Helper()
+
+	resolved := options.UpdateOneOptions{}
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		for _, setter := range opt.List() {
+			if err := setter(&resolved); err != nil {
+				t.Fatalf("failed to resolve update options: %v", err)
+			}
+		}
+	}
+
+	return resolved.Upsert != nil && *resolved.Upsert
 }
 
 func findLogEvent(entries []*logrus.Entry, event string) *logrus.Entry {

@@ -6,10 +6,10 @@ import (
 	"errors"
 	"fmt"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.mongodb.org/mongo-driver/mongo/readpref"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 
 	"bot/internal/config"
 )
@@ -24,13 +24,13 @@ const (
 // lightweight stubbing in tests without a live Mongo deployment.
 type mongoClient interface {
 	Ping(context.Context, *readpref.ReadPref) error
-	Database(string, ...*options.DatabaseOptions) *mongo.Database
+	Database(string, ...options.Lister[options.DatabaseOptions]) *mongo.Database
 	Disconnect(context.Context) error
 }
 
 // connectMongo is overridable for tests.
 var connectMongo = func(ctx context.Context, opts *options.ClientOptions) (mongoClient, error) {
-	return mongo.Connect(ctx, opts)
+	return mongo.Connect(opts)
 }
 
 // createIndexes is overridable for tests.
