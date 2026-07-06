@@ -30,6 +30,18 @@ const (
 	statusLookupTimeout = 2 * time.Second
 	statusCountTimeout  = 2 * time.Second
 	botIdentityTimeout  = 2 * time.Second
+	commandAuthTimeout  = 2 * time.Second
+	listLookupTimeout   = 2 * time.Second
+	roleUpdateTimeout   = 2 * time.Second
+
+	defaultCommandListLimit = 10
+	maxCommandListLimit     = 50
+)
+
+var (
+	errInvalidCommandLimit = errors.New("invalid command limit")
+	errInvalidSetRoleUsage = errors.New("invalid setrole usage")
+	errInvalidSetRoleRole  = errors.New("invalid setrole role")
 )
 
 var (
@@ -69,6 +81,21 @@ type UserFetcher interface {
 	GetByID(ctx context.Context, userID int64) (domain.User, error)
 }
 
+// UserLister retrieves recent users for administrative commands.
+type UserLister interface {
+	List(ctx context.Context, limit int) ([]domain.User, error)
+}
+
+// GroupLister retrieves recent groups for administrative commands.
+type GroupLister interface {
+	List(ctx context.Context, limit int) ([]domain.Group, error)
+}
+
+// UserRoleSetter updates user roles for owner-only management commands.
+type UserRoleSetter interface {
+	SetRole(ctx context.Context, userID int64, role string) error
+}
+
 // StatsProvider exposes simple collection counts for diagnostics.
 type StatsProvider interface {
 	CountUsers(ctx context.Context) (int64, error)
@@ -76,13 +103,16 @@ type StatsProvider interface {
 }
 
 type commandDiagnostics struct {
-	appEnv        string
-	processStart  time.Time
-	botUsername   string
-	botUsernameFn func() string
-	mongoChecker  MongoChecker
-	userFetcher   UserFetcher
-	statsProvider StatsProvider
+	appEnv         string
+	processStart   time.Time
+	botUsername    string
+	botUsernameFn  func() string
+	mongoChecker   MongoChecker
+	userFetcher    UserFetcher
+	userLister     UserLister
+	groupLister    GroupLister
+	userRoleSetter UserRoleSetter
+	statsProvider  StatsProvider
 }
 
 type clientOptions struct {
@@ -91,6 +121,9 @@ type clientOptions struct {
 	mongoChecker   MongoChecker
 	processStart   time.Time
 	userFetcher    UserFetcher
+	userLister     UserLister
+	groupLister    GroupLister
+	userRoleSetter UserRoleSetter
 	statsProvider  StatsProvider
 }
 
@@ -137,6 +170,27 @@ func WithUserFetcher(fetcher UserFetcher) ClientOption {
 	}
 }
 
+// WithUserLister supplies a user lister for administrative commands.
+func WithUserLister(lister UserLister) ClientOption {
+	return func(opts *clientOptions) {
+		opts.userLister = lister
+	}
+}
+
+// WithGroupLister supplies a group lister for administrative commands.
+func WithGroupLister(lister GroupLister) ClientOption {
+	return func(opts *clientOptions) {
+		opts.groupLister = lister
+	}
+}
+
+// WithUserRoleSetter supplies role update behavior for owner commands.
+func WithUserRoleSetter(setter UserRoleSetter) ClientOption {
+	return func(opts *clientOptions) {
+		opts.userRoleSetter = setter
+	}
+}
+
 // WithStatsProvider supplies a diagnostics provider for live collection counts.
 func WithStatsProvider(provider StatsProvider) ClientOption {
 	return func(opts *clientOptions) {
@@ -168,12 +222,15 @@ func NewClient(cfg config.Config, logger *logrus.Entry, opts ...ClientOption) (*
 
 	identity := &botIdentity{}
 	diag := normalizeDiagnostics(commandDiagnostics{
-		appEnv:        cfg.AppEnv,
-		processStart:  clientOpts.processStart,
-		botUsernameFn: identity.Username,
-		mongoChecker:  clientOpts.mongoChecker,
-		userFetcher:   clientOpts.userFetcher,
-		statsProvider: clientOpts.statsProvider,
+		appEnv:         cfg.AppEnv,
+		processStart:   clientOpts.processStart,
+		botUsernameFn:  identity.Username,
+		mongoChecker:   clientOpts.mongoChecker,
+		userFetcher:    clientOpts.userFetcher,
+		userLister:     clientOpts.userLister,
+		groupLister:    clientOpts.groupLister,
+		userRoleSetter: clientOpts.userRoleSetter,
+		statsProvider:  clientOpts.statsProvider,
 	})
 
 	tgBot, err := createBot(cfg.TelegramToken,
@@ -321,6 +378,22 @@ func newMessageRouter(logger *logrus.Entry, botOwnerID int64, diag commandDiagno
 			"status": {
 				name:    "command_status",
 				handler: statusCommandHandler(logger, botOwnerID, diag),
+			},
+			"whoami": {
+				name:    "command_whoami",
+				handler: whoamiCommandHandler(logger, diag),
+			},
+			"users": {
+				name:    "command_users",
+				handler: usersCommandHandler(logger, diag),
+			},
+			"chats": {
+				name:    "command_chats",
+				handler: chatsCommandHandler(logger, diag),
+			},
+			"setrole": {
+				name:    "command_setrole",
+				handler: setRoleCommandHandler(logger, botOwnerID, diag),
 			},
 		},
 		unknownHandler: registeredHandler{
@@ -775,9 +848,13 @@ func helpCommandHandler(logger *logrus.Entry) bot.HandlerFunc {
 func helpMessage() string {
 	lines := []string{
 		"Available commands:",
+		"/whoami - show your user, chat, and role",
 		"/help - show this guide",
 		"/ping - health diagnostics",
 		"/status - owner-only runtime status",
+		"/users [limit] - list recent users (admin)",
+		"/chats [limit] - list recent chats (admin)",
+		"/setrole <user_id> <admin|user> - update a user role (owner)",
 	}
 
 	return strings.Join(lines, "\n")
@@ -983,6 +1060,362 @@ func statusMessage(appEnv string, counts statusCounts) string {
 	}
 
 	return strings.Join(lines, "\n")
+}
+
+func whoamiCommandHandler(logger *logrus.Entry, diag commandDiagnostics) bot.HandlerFunc {
+	if logger == nil {
+		logger = logging.Logger()
+	}
+	diag = normalizeDiagnostics(diag)
+
+	return func(ctx context.Context, b *bot.Bot, update *models.Update) {
+		if ctx == nil || update == nil {
+			return
+		}
+
+		meta := extractUpdateMeta(update)
+		logCommandHandled(logger, "command_whoami", meta)
+
+		role, ok := fetchCommandUserRole(ctx, logger, diag, meta, "command_whoami")
+		if !ok {
+			role = "unknown"
+		}
+
+		sendText(ctx, b, logger, meta, "command_whoami", whoamiMessage(meta, role))
+	}
+}
+
+func usersCommandHandler(logger *logrus.Entry, diag commandDiagnostics) bot.HandlerFunc {
+	if logger == nil {
+		logger = logging.Logger()
+	}
+	diag = normalizeDiagnostics(diag)
+
+	return func(ctx context.Context, b *bot.Bot, update *models.Update) {
+		if ctx == nil || update == nil {
+			return
+		}
+
+		meta := extractUpdateMeta(update)
+		logCommandHandled(logger, "command_users", meta)
+
+		role, authorized := authorizeCommandRole(ctx, logger, diag, meta, "command_users", domain.RolePriorityAdmin)
+		if !authorized {
+			sendText(ctx, b, logger, meta, "command_users", "permission denied")
+			logCommandDenied(logger, meta, "command_users", role)
+			return
+		}
+
+		_, args := splitCommandText(meta.text)
+		limit, err := parseCommandLimit(args)
+		if err != nil {
+			sendText(ctx, b, logger, meta, "command_users", commandLimitUsage("users"))
+			return
+		}
+
+		if diag.userLister == nil {
+			logger.WithFields(commandLogFields(meta, "command_users_lister_missing", role)).Error("users command missing user lister")
+			sendText(ctx, b, logger, meta, "command_users", "user listing unavailable")
+			return
+		}
+
+		listCtx, cancel := context.WithTimeout(ctx, listLookupTimeout)
+		users, err := diag.userLister.List(listCtx, limit)
+		cancel()
+		if err != nil {
+			logger.WithFields(commandLogFields(meta, "command_users_list_failed", role)).WithError(err).Error("failed to list users")
+			sendText(ctx, b, logger, meta, "command_users", "user listing failed")
+			return
+		}
+
+		sendText(ctx, b, logger, meta, "command_users", usersMessage(users))
+	}
+}
+
+func chatsCommandHandler(logger *logrus.Entry, diag commandDiagnostics) bot.HandlerFunc {
+	if logger == nil {
+		logger = logging.Logger()
+	}
+	diag = normalizeDiagnostics(diag)
+
+	return func(ctx context.Context, b *bot.Bot, update *models.Update) {
+		if ctx == nil || update == nil {
+			return
+		}
+
+		meta := extractUpdateMeta(update)
+		logCommandHandled(logger, "command_chats", meta)
+
+		role, authorized := authorizeCommandRole(ctx, logger, diag, meta, "command_chats", domain.RolePriorityAdmin)
+		if !authorized {
+			sendText(ctx, b, logger, meta, "command_chats", "permission denied")
+			logCommandDenied(logger, meta, "command_chats", role)
+			return
+		}
+
+		_, args := splitCommandText(meta.text)
+		limit, err := parseCommandLimit(args)
+		if err != nil {
+			sendText(ctx, b, logger, meta, "command_chats", commandLimitUsage("chats"))
+			return
+		}
+
+		if diag.groupLister == nil {
+			logger.WithFields(commandLogFields(meta, "command_chats_lister_missing", role)).Error("chats command missing group lister")
+			sendText(ctx, b, logger, meta, "command_chats", "chat listing unavailable")
+			return
+		}
+
+		listCtx, cancel := context.WithTimeout(ctx, listLookupTimeout)
+		groups, err := diag.groupLister.List(listCtx, limit)
+		cancel()
+		if err != nil {
+			logger.WithFields(commandLogFields(meta, "command_chats_list_failed", role)).WithError(err).Error("failed to list chats")
+			sendText(ctx, b, logger, meta, "command_chats", "chat listing failed")
+			return
+		}
+
+		sendText(ctx, b, logger, meta, "command_chats", chatsMessage(groups))
+	}
+}
+
+func setRoleCommandHandler(logger *logrus.Entry, botOwnerID int64, diag commandDiagnostics) bot.HandlerFunc {
+	if logger == nil {
+		logger = logging.Logger()
+	}
+	diag = normalizeDiagnostics(diag)
+
+	return func(ctx context.Context, b *bot.Bot, update *models.Update) {
+		if ctx == nil || update == nil {
+			return
+		}
+
+		meta := extractUpdateMeta(update)
+		logCommandHandled(logger, "command_setrole", meta)
+
+		role, authorized := authorizeCommandRole(ctx, logger, diag, meta, "command_setrole", domain.RolePriorityOwner)
+		if !authorized || meta.userID != botOwnerID {
+			sendText(ctx, b, logger, meta, "command_setrole", "permission denied")
+			logCommandDenied(logger, meta, "command_setrole", role)
+			return
+		}
+
+		_, args := splitCommandText(meta.text)
+		targetID, newRole, err := parseSetRoleArgs(args)
+		if err != nil {
+			switch {
+			case errors.Is(err, errInvalidSetRoleRole):
+				sendText(ctx, b, logger, meta, "command_setrole", "invalid role: must be admin or user")
+			default:
+				sendText(ctx, b, logger, meta, "command_setrole", "usage: /setrole <user_id> <admin|user>")
+			}
+			return
+		}
+
+		if targetID == botOwnerID {
+			sendText(ctx, b, logger, meta, "command_setrole", "cannot change configured owner role")
+			return
+		}
+
+		if diag.userRoleSetter == nil {
+			logger.WithFields(commandLogFields(meta, "command_setrole_setter_missing", role)).Error("setrole command missing role setter")
+			sendText(ctx, b, logger, meta, "command_setrole", "role update unavailable")
+			return
+		}
+
+		roleCtx, cancel := context.WithTimeout(ctx, roleUpdateTimeout)
+		err = diag.userRoleSetter.SetRole(roleCtx, targetID, newRole)
+		cancel()
+		if errors.Is(err, domain.ErrUserNotFound) {
+			sendText(ctx, b, logger, meta, "command_setrole", "user not found")
+			return
+		}
+		if err != nil {
+			fields := commandLogFields(meta, "command_setrole_failed", role)
+			fields["target_user_id"] = targetID
+			fields["target_role"] = newRole
+			logger.WithFields(fields).WithError(err).Error("failed to update user role")
+			sendText(ctx, b, logger, meta, "command_setrole", "role update failed")
+			return
+		}
+
+		sendText(ctx, b, logger, meta, "command_setrole", roleUpdatedMessage(targetID, newRole))
+	}
+}
+
+func fetchCommandUserRole(ctx context.Context, logger *logrus.Entry, diag commandDiagnostics, meta updateMeta, event string) (string, bool) {
+	if meta.userID == 0 {
+		logger.WithFields(commandLogFields(meta, event+"_user_missing", "")).Warn("command user_id missing")
+		return "", false
+	}
+	if diag.userFetcher == nil {
+		logger.WithFields(commandLogFields(meta, event+"_user_fetcher_missing", "")).Error("command missing user fetcher")
+		return "", false
+	}
+
+	authCtx, cancel := context.WithTimeout(ctx, commandAuthTimeout)
+	user, err := diag.userFetcher.GetByID(authCtx, meta.userID)
+	cancel()
+	if err != nil {
+		logger.WithFields(commandLogFields(meta, event+"_user_lookup_failed", "")).WithError(err).Error("failed to load command user")
+		return "", false
+	}
+
+	return strings.TrimSpace(user.Role), true
+}
+
+func authorizeCommandRole(ctx context.Context, logger *logrus.Entry, diag commandDiagnostics, meta updateMeta, event string, minPriority int) (string, bool) {
+	role, ok := fetchCommandUserRole(ctx, logger, diag, meta, event)
+	if !ok {
+		return role, false
+	}
+	return role, domain.RolePriority(role) >= minPriority
+}
+
+func logCommandDenied(logger *logrus.Entry, meta updateMeta, event, role string) {
+	logger.WithFields(commandLogFields(meta, event+"_denied", role)).Info("command denied")
+}
+
+func commandLogFields(meta updateMeta, event, role string) logging.Fields {
+	fields := logging.Fields{
+		"event":     event,
+		"chat_type": normalizeChatType(meta.chatType),
+	}
+	if meta.userID != 0 {
+		fields["user_id"] = meta.userID
+	}
+	if meta.chatID != 0 {
+		fields["chat_id"] = meta.chatID
+	}
+	if strings.TrimSpace(role) != "" {
+		fields["role"] = strings.TrimSpace(role)
+	}
+	return fields
+}
+
+func parseCommandLimit(args string) (int, error) {
+	fields := strings.Fields(args)
+	if len(fields) == 0 {
+		return defaultCommandListLimit, nil
+	}
+	if len(fields) != 1 {
+		return 0, errInvalidCommandLimit
+	}
+
+	limit, err := strconv.Atoi(fields[0])
+	if err != nil || limit <= 0 {
+		return 0, errInvalidCommandLimit
+	}
+	if limit > maxCommandListLimit {
+		return maxCommandListLimit, nil
+	}
+	return limit, nil
+}
+
+func parseSetRoleArgs(args string) (int64, string, error) {
+	fields := strings.Fields(args)
+	if len(fields) != 2 {
+		return 0, "", errInvalidSetRoleUsage
+	}
+
+	userID, err := strconv.ParseInt(fields[0], 10, 64)
+	if err != nil || userID == 0 {
+		return 0, "", errInvalidSetRoleUsage
+	}
+
+	role := strings.ToLower(strings.TrimSpace(fields[1]))
+	if role != domain.RoleAdmin && role != domain.RoleUser {
+		return 0, "", errInvalidSetRoleRole
+	}
+
+	return userID, role, nil
+}
+
+func commandLimitUsage(command string) string {
+	return fmt.Sprintf("usage: /%s [limit 1-%d]", command, maxCommandListLimit)
+}
+
+func whoamiMessage(meta updateMeta, role string) string {
+	lines := []string{
+		"whoami:",
+		"user_id: " + formatIntOrUnknown(meta.userID),
+		"chat_id: " + formatIntOrUnknown(meta.chatID),
+		"chat_type: " + normalizeChatType(meta.chatType),
+		"role: " + formatRole(role),
+	}
+	return strings.Join(lines, "\n")
+}
+
+func usersMessage(users []domain.User) string {
+	if len(users) == 0 {
+		return "users: none"
+	}
+
+	lines := []string{"users:"}
+	for idx, user := range users {
+		lines = append(lines, fmt.Sprintf("%d. user_id: %d role: %s last_seen: %s",
+			idx+1,
+			user.UserID,
+			formatRole(user.Role),
+			formatTimestamp(user.LastSeenAt),
+		))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func chatsMessage(groups []domain.Group) string {
+	if len(groups) == 0 {
+		return "chats: none"
+	}
+
+	lines := []string{"chats:"}
+	for idx, group := range groups {
+		lines = append(lines, fmt.Sprintf("%d. chat_id: %d title: %s last_seen: %s",
+			idx+1,
+			group.ChatID,
+			formatTitle(group.Title),
+			formatTimestamp(group.LastSeenAt),
+		))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func roleUpdatedMessage(userID int64, role string) string {
+	return strings.Join([]string{
+		"role updated",
+		fmt.Sprintf("user_id: %d", userID),
+		"role: " + formatRole(role),
+	}, "\n")
+}
+
+func formatIntOrUnknown(value int64) string {
+	if value == 0 {
+		return "unknown"
+	}
+	return strconv.FormatInt(value, 10)
+}
+
+func formatRole(role string) string {
+	role = strings.TrimSpace(role)
+	if role == "" {
+		return "unknown"
+	}
+	return role
+}
+
+func formatTitle(title string) string {
+	title = strings.Join(strings.Fields(title), " ")
+	if title == "" {
+		return "(untitled)"
+	}
+	return title
+}
+
+func formatTimestamp(ts time.Time) string {
+	if ts.IsZero() {
+		return "unknown"
+	}
+	return ts.UTC().Format(time.RFC3339)
 }
 
 func unknownCommandHandler(logger *logrus.Entry) bot.HandlerFunc {

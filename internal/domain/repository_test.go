@@ -2,7 +2,9 @@ package domain
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sort"
 	"testing"
 	"time"
 
@@ -115,6 +117,122 @@ func TestGroupRepositoryCreateAndGet(t *testing.T) {
 	}
 }
 
+func TestUserRepositoryListSortsByLastSeenAndLimits(t *testing.T) {
+	coll := newFakeInsertFindCollection(t)
+	repo := NewUserRepository(coll)
+	ctx := context.Background()
+
+	base := time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC)
+	for _, user := range []User{
+		{UserID: 1, Role: RoleUser, LastSeenAt: base.Add(-2 * time.Hour)},
+		{UserID: 2, Role: RoleAdmin, LastSeenAt: base},
+		{UserID: 3, Role: RoleUser, LastSeenAt: base.Add(-time.Hour)},
+	} {
+		if _, err := repo.Create(ctx, user); err != nil {
+			t.Fatalf("Create returned error: %v", err)
+		}
+	}
+
+	users, err := repo.List(ctx, 2)
+	if err != nil {
+		t.Fatalf("List returned error: %v", err)
+	}
+	if len(users) != 2 {
+		t.Fatalf("expected 2 users, got %d", len(users))
+	}
+	if users[0].UserID != 2 || users[1].UserID != 3 {
+		t.Fatalf("expected users sorted by last seen desc, got %+v", users)
+	}
+	if coll.lastFindLimit != 2 {
+		t.Fatalf("expected find limit 2, got %d", coll.lastFindLimit)
+	}
+}
+
+func TestUserRepositoryListCapsLimit(t *testing.T) {
+	coll := newFakeInsertFindCollection(t)
+	repo := NewUserRepository(coll)
+
+	if _, err := repo.List(context.Background(), 500); err != nil {
+		t.Fatalf("List returned error: %v", err)
+	}
+	if coll.lastFindLimit != maxListLimit {
+		t.Fatalf("expected capped limit %d, got %d", maxListLimit, coll.lastFindLimit)
+	}
+}
+
+func TestGroupRepositoryListSortsByLastSeenAndLimits(t *testing.T) {
+	coll := newFakeInsertFindCollection(t)
+	repo := NewGroupRepository(coll)
+	ctx := context.Background()
+
+	base := time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC)
+	for _, group := range []Group{
+		{ChatID: -1, Title: "Old", LastSeenAt: base.Add(-2 * time.Hour)},
+		{ChatID: -2, Title: "Newest", LastSeenAt: base},
+		{ChatID: -3, Title: "Middle", LastSeenAt: base.Add(-time.Hour)},
+	} {
+		if _, err := repo.Create(ctx, group); err != nil {
+			t.Fatalf("Create returned error: %v", err)
+		}
+	}
+
+	groups, err := repo.List(ctx, 2)
+	if err != nil {
+		t.Fatalf("List returned error: %v", err)
+	}
+	if len(groups) != 2 {
+		t.Fatalf("expected 2 groups, got %d", len(groups))
+	}
+	if groups[0].ChatID != -2 || groups[1].ChatID != -3 {
+		t.Fatalf("expected groups sorted by last seen desc, got %+v", groups)
+	}
+	if coll.lastFindLimit != 2 {
+		t.Fatalf("expected find limit 2, got %d", coll.lastFindLimit)
+	}
+}
+
+func TestUserRepositorySetRole(t *testing.T) {
+	coll := newFakeInsertFindCollection(t)
+	repo := NewUserRepository(coll)
+	ctx := context.Background()
+
+	if _, err := repo.Create(ctx, User{UserID: 42, Role: RoleUser}); err != nil {
+		t.Fatalf("Create returned error: %v", err)
+	}
+
+	if err := repo.SetRole(ctx, 42, RoleAdmin); err != nil {
+		t.Fatalf("SetRole returned error: %v", err)
+	}
+
+	found, err := repo.GetByID(ctx, 42)
+	if err != nil {
+		t.Fatalf("GetByID returned error: %v", err)
+	}
+	if found.Role != RoleAdmin {
+		t.Fatalf("expected role %s, got %s", RoleAdmin, found.Role)
+	}
+
+	doc := coll.docFor(t, "user_id", int64(42))
+	assertTimeFieldSet(t, doc, "updated_at")
+}
+
+func TestUserRepositorySetRoleRejectsInvalidRole(t *testing.T) {
+	repo := NewUserRepository(newFakeInsertFindCollection(t))
+
+	if err := repo.SetRole(context.Background(), 42, RoleOwner); err == nil {
+		t.Fatalf("expected owner role to be rejected")
+	}
+}
+
+func TestUserRepositorySetRoleReturnsNotFound(t *testing.T) {
+	repo := NewUserRepository(newFakeInsertFindCollection(t))
+
+	err := repo.SetRole(context.Background(), 42, RoleAdmin)
+	if !errors.Is(err, ErrUserNotFound) {
+		t.Fatalf("expected ErrUserNotFound, got %v", err)
+	}
+}
+
 func TestRolePriority(t *testing.T) {
 	tests := []struct {
 		role     string
@@ -134,8 +252,9 @@ func TestRolePriority(t *testing.T) {
 }
 
 type fakeInsertFindCollection struct {
-	t    *testing.T
-	docs map[string]bson.M
+	t             *testing.T
+	docs          map[string]bson.M
+	lastFindLimit int64
 }
 
 func newFakeInsertFindCollection(t *testing.T) *fakeInsertFindCollection {
@@ -175,6 +294,68 @@ func (f *fakeInsertFindCollection) FindOne(ctx context.Context, filter interface
 	}
 
 	return mongo.NewSingleResultFromDocument(nil, fmt.Errorf("missing id filter in %v", filterDoc), nil)
+}
+
+func (f *fakeInsertFindCollection) Find(ctx context.Context, filter interface{}, opts ...options.Lister[options.FindOptions]) (*mongo.Cursor, error) {
+	if !isEmptyFilter(filter) {
+		return nil, fmt.Errorf("unexpected filter %v", filter)
+	}
+
+	findOpts := applyFindOptions(f.t, opts...)
+	if findOpts.Limit != nil {
+		f.lastFindLimit = *findOpts.Limit
+	}
+
+	docs := make([]bson.M, 0, len(f.docs))
+	for _, doc := range f.docs {
+		docs = append(docs, doc)
+	}
+	sort.Slice(docs, func(i, j int) bool {
+		return docLastSeen(f.t, docs[i]).After(docLastSeen(f.t, docs[j]))
+	})
+
+	if findOpts.Limit != nil && *findOpts.Limit >= 0 && int64(len(docs)) > *findOpts.Limit {
+		docs = docs[:*findOpts.Limit]
+	}
+
+	cursorDocs := make([]any, 0, len(docs))
+	for _, doc := range docs {
+		cursorDocs = append(cursorDocs, doc)
+	}
+
+	return mongo.NewCursorFromDocuments(cursorDocs, nil, nil)
+}
+
+func (f *fakeInsertFindCollection) UpdateOne(ctx context.Context, filter interface{}, update interface{}, opts ...options.Lister[options.UpdateOneOptions]) (*mongo.UpdateResult, error) {
+	filterDoc, ok := filter.(bson.M)
+	if !ok {
+		return nil, fmt.Errorf("unexpected filter type %T", filter)
+	}
+	userID, ok := filterDoc["user_id"]
+	if !ok {
+		return nil, fmt.Errorf("missing user_id filter in %v", filterDoc)
+	}
+
+	key := f.key("user_id", userID)
+	doc, found := f.docs[key]
+	if !found {
+		return &mongo.UpdateResult{}, nil
+	}
+
+	updateDoc, ok := update.(bson.M)
+	if !ok {
+		return nil, fmt.Errorf("unexpected update type %T", update)
+	}
+	setFields, ok := updateDoc["$set"].(bson.M)
+	if !ok {
+		return nil, fmt.Errorf("missing $set in update %v", updateDoc)
+	}
+	for field, value := range setFields {
+		doc[field] = value
+	}
+	f.docs[key] = doc
+
+	return &mongo.UpdateResult{MatchedCount: 1, ModifiedCount: 1}, nil
 }
 
 func (f *fakeInsertFindCollection) key(field string, value interface{}) string {
@@ -220,6 +401,44 @@ func idField(doc bson.M) (string, interface{}) {
 		return "chat_id", val
 	}
 	return "", nil
+}
+
+func isEmptyFilter(filter interface{}) bool {
+	switch doc := filter.(type) {
+	case bson.D:
+		return len(doc) == 0
+	case bson.M:
+		return len(doc) == 0
+	default:
+		return false
+	}
+}
+
+func applyFindOptions(t *testing.T, opts ...options.Lister[options.FindOptions]) options.FindOptions {
+	t.Helper()
+
+	var out options.FindOptions
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		for _, setter := range opt.List() {
+			if err := setter(&out); err != nil {
+				t.Fatalf("apply find option: %v", err)
+			}
+		}
+	}
+	return out
+}
+
+func docLastSeen(t *testing.T, doc bson.M) time.Time {
+	t.Helper()
+
+	value, ok := doc["last_seen_at"]
+	if !ok {
+		return time.Time{}
+	}
+	return parseTime(t, value)
 }
 
 func assertStringField(t *testing.T, doc bson.M, field, expected string) {

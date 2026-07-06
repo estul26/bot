@@ -338,6 +338,10 @@ func TestRouterRoutesCommandsAndGenericMessages(t *testing.T) {
 		{name: "start", text: "/start", want: "command_start"},
 		{name: "help mention", text: "/help@template_bot", want: "command_help"},
 		{name: "unknown", text: "/missing", want: "command_unknown"},
+		{name: "whoami", text: "/whoami", want: "command_whoami"},
+		{name: "users", text: "/users", want: "command_users"},
+		{name: "chats", text: "/chats", want: "command_chats"},
+		{name: "setrole", text: "/setrole 7 admin", want: "command_setrole"},
 		{name: "generic", text: "hello", want: "generic_message"},
 	}
 
@@ -471,6 +475,208 @@ func TestStatusCommandDeniesNonOwner(t *testing.T) {
 	}
 }
 
+func TestWhoamiCommandRepliesWithRole(t *testing.T) {
+	sent, restore := stubSendMessage(t)
+	defer restore()
+
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+
+	whoamiCommandHandler(logrus.NewEntry(logger), commandDiagnostics{
+		userFetcher: &stubUserFetcher{user: domain.User{UserID: 42, Role: domain.RoleAdmin}},
+	})(context.Background(), newTestBot(t), privateTextUpdate(42, 42, "/whoami"))
+
+	if len(*sent) != 1 {
+		t.Fatalf("expected one whoami message, got %d", len(*sent))
+	}
+	text := (*sent)[0].Text
+	for _, expected := range []string{"whoami:", "user_id: 42", "chat_id: 42", "chat_type: private", "role: admin"} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("expected %q in whoami message %q", expected, text)
+		}
+	}
+}
+
+func TestListCommandsAllowAdminAndOwner(t *testing.T) {
+	sent, restore := stubSendMessage(t)
+	defer restore()
+
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	base := time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC)
+
+	userLister := &stubUserLister{
+		users: []domain.User{
+			{UserID: 100, Role: domain.RoleUser, LastSeenAt: base},
+			{UserID: 101, Role: domain.RoleAdmin, LastSeenAt: base.Add(-time.Hour)},
+		},
+	}
+	usersCommandHandler(logrus.NewEntry(logger), commandDiagnostics{
+		userFetcher: &stubUserFetcher{user: domain.User{UserID: 42, Role: domain.RoleAdmin}},
+		userLister:  userLister,
+	})(context.Background(), newTestBot(t), privateTextUpdate(42, 42, "/users 2"))
+
+	groupLister := &stubGroupLister{
+		groups: []domain.Group{
+			{ChatID: -100, Title: "Team Chat", LastSeenAt: base},
+		},
+	}
+	chatsCommandHandler(logrus.NewEntry(logger), commandDiagnostics{
+		userFetcher: &stubUserFetcher{user: domain.User{UserID: 42, Role: domain.RoleOwner}},
+		groupLister: groupLister,
+	})(context.Background(), newTestBot(t), privateTextUpdate(42, 42, "/chats"))
+
+	if userLister.limit != 2 {
+		t.Fatalf("expected user list limit 2, got %d", userLister.limit)
+	}
+	if groupLister.limit != defaultCommandListLimit {
+		t.Fatalf("expected default chat list limit %d, got %d", defaultCommandListLimit, groupLister.limit)
+	}
+	if len(*sent) != 2 {
+		t.Fatalf("expected two list messages, got %d", len(*sent))
+	}
+	for _, expected := range []string{"users:", "user_id: 100", "role: user"} {
+		if !strings.Contains((*sent)[0].Text, expected) {
+			t.Fatalf("expected %q in users message %q", expected, (*sent)[0].Text)
+		}
+	}
+	for _, expected := range []string{"chats:", "chat_id: -100", "title: Team Chat"} {
+		if !strings.Contains((*sent)[1].Text, expected) {
+			t.Fatalf("expected %q in chats message %q", expected, (*sent)[1].Text)
+		}
+	}
+}
+
+func TestListCommandsDenyNormalUser(t *testing.T) {
+	sent, restore := stubSendMessage(t)
+	defer restore()
+
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	userLister := &stubUserLister{}
+	groupLister := &stubGroupLister{}
+	diag := commandDiagnostics{
+		userFetcher: &stubUserFetcher{user: domain.User{UserID: 7, Role: domain.RoleUser}},
+		userLister:  userLister,
+		groupLister: groupLister,
+	}
+
+	usersCommandHandler(logrus.NewEntry(logger), diag)(context.Background(), newTestBot(t), privateTextUpdate(7, 7, "/users"))
+	chatsCommandHandler(logrus.NewEntry(logger), diag)(context.Background(), newTestBot(t), privateTextUpdate(7, 7, "/chats"))
+
+	if len(*sent) != 2 {
+		t.Fatalf("expected two denial messages, got %d", len(*sent))
+	}
+	if (*sent)[0].Text != "permission denied" || (*sent)[1].Text != "permission denied" {
+		t.Fatalf("expected permission denials, got %q and %q", (*sent)[0].Text, (*sent)[1].Text)
+	}
+	if userLister.limit != 0 || groupLister.limit != 0 {
+		t.Fatalf("expected listers not to be called, got user limit %d group limit %d", userLister.limit, groupLister.limit)
+	}
+}
+
+func TestSetRoleCommandSuccess(t *testing.T) {
+	sent, restore := stubSendMessage(t)
+	defer restore()
+
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	setter := &stubUserRoleSetter{}
+
+	setRoleCommandHandler(logrus.NewEntry(logger), 42, commandDiagnostics{
+		userFetcher:    &stubUserFetcher{user: domain.User{UserID: 42, Role: domain.RoleOwner}},
+		userRoleSetter: setter,
+	})(context.Background(), newTestBot(t), privateTextUpdate(42, 42, "/setrole 7 admin"))
+
+	if setter.calls != 1 || setter.userID != 7 || setter.role != domain.RoleAdmin {
+		t.Fatalf("unexpected setrole call: calls=%d user_id=%d role=%s", setter.calls, setter.userID, setter.role)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("expected one role update message, got %d", len(*sent))
+	}
+	for _, expected := range []string{"role updated", "user_id: 7", "role: admin"} {
+		if !strings.Contains((*sent)[0].Text, expected) {
+			t.Fatalf("expected %q in setrole message %q", expected, (*sent)[0].Text)
+		}
+	}
+}
+
+func TestSetRoleCommandErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		fromUserID int64
+		userRole   string
+		text       string
+		setterErr  error
+		wantText   string
+		wantCalls  int
+	}{
+		{
+			name:       "invalid args",
+			fromUserID: 42,
+			userRole:   domain.RoleOwner,
+			text:       "/setrole",
+			wantText:   "usage: /setrole <user_id> <admin|user>",
+		},
+		{
+			name:       "invalid role",
+			fromUserID: 42,
+			userRole:   domain.RoleOwner,
+			text:       "/setrole 7 owner",
+			wantText:   "invalid role: must be admin or user",
+		},
+		{
+			name:       "missing user",
+			fromUserID: 42,
+			userRole:   domain.RoleOwner,
+			text:       "/setrole 7 admin",
+			setterErr:  domain.ErrUserNotFound,
+			wantText:   "user not found",
+			wantCalls:  1,
+		},
+		{
+			name:       "non owner",
+			fromUserID: 7,
+			userRole:   domain.RoleAdmin,
+			text:       "/setrole 8 admin",
+			wantText:   "permission denied",
+		},
+		{
+			name:       "configured owner target",
+			fromUserID: 42,
+			userRole:   domain.RoleOwner,
+			text:       "/setrole 42 user",
+			wantText:   "cannot change configured owner role",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sent, restore := stubSendMessage(t)
+			defer restore()
+
+			logger := logrus.New()
+			logger.SetOutput(io.Discard)
+			setter := &stubUserRoleSetter{err: tt.setterErr}
+
+			setRoleCommandHandler(logrus.NewEntry(logger), 42, commandDiagnostics{
+				userFetcher:    &stubUserFetcher{user: domain.User{UserID: tt.fromUserID, Role: tt.userRole}},
+				userRoleSetter: setter,
+			})(context.Background(), newTestBot(t), privateTextUpdate(tt.fromUserID, tt.fromUserID, tt.text))
+
+			if len(*sent) != 1 {
+				t.Fatalf("expected one response, got %d", len(*sent))
+			}
+			if (*sent)[0].Text != tt.wantText {
+				t.Fatalf("expected response %q, got %q", tt.wantText, (*sent)[0].Text)
+			}
+			if setter.calls != tt.wantCalls {
+				t.Fatalf("expected setter calls %d, got %d", tt.wantCalls, setter.calls)
+			}
+		})
+	}
+}
+
 func TestSplitCommandTextSupportsMentionAndNewlineArgs(t *testing.T) {
 	cmd, args := splitCommandText("/status@template_bot\nextra text")
 	if cmd != "status" || args != "extra text" {
@@ -558,6 +764,42 @@ type stubUserFetcher struct {
 
 func (s *stubUserFetcher) GetByID(context.Context, int64) (domain.User, error) {
 	return s.user, s.err
+}
+
+type stubUserLister struct {
+	users []domain.User
+	limit int
+	err   error
+}
+
+func (s *stubUserLister) List(_ context.Context, limit int) ([]domain.User, error) {
+	s.limit = limit
+	return s.users, s.err
+}
+
+type stubGroupLister struct {
+	groups []domain.Group
+	limit  int
+	err    error
+}
+
+func (s *stubGroupLister) List(_ context.Context, limit int) ([]domain.Group, error) {
+	s.limit = limit
+	return s.groups, s.err
+}
+
+type stubUserRoleSetter struct {
+	userID int64
+	role   string
+	calls  int
+	err    error
+}
+
+func (s *stubUserRoleSetter) SetRole(_ context.Context, userID int64, role string) error {
+	s.calls++
+	s.userID = userID
+	s.role = role
+	return s.err
 }
 
 type stubStatsProvider struct {

@@ -94,6 +94,7 @@ func main() {
 	userRegistrar := user.NewRegistrar(mongoManager.Users(), logger)
 	groupRegistrar := group.NewRegistrar(mongoManager.Groups(), logger)
 	userRepository := domain.NewUserRepository(mongoManager.Users())
+	groupRepository := domain.NewGroupRepository(mongoManager.Groups())
 	statsProvider := store.NewStatsProvider(mongoManager.Users(), mongoManager.Groups())
 
 	tgClient, err := telegram.NewClient(cfg, logger,
@@ -102,6 +103,9 @@ func main() {
 		telegram.WithMongoChecker(mongoManager),
 		telegram.WithProcessStart(processStart),
 		telegram.WithUserFetcher(userRepository),
+		telegram.WithUserLister(userRepository),
+		telegram.WithGroupLister(groupRepository),
+		telegram.WithUserRoleSetter(userRepository),
 		telegram.WithStatsProvider(statsProvider),
 	)
 	if err != nil {

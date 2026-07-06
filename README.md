@@ -23,6 +23,10 @@ Use this repository when you want to start a new Telegram bot without rebuilding
 - `/help` lists available commands.
 - `/ping` returns app environment, uptime, and MongoDB health.
 - `/status` returns user/group counts for the configured owner only.
+- `/whoami` returns the caller's Telegram IDs, chat type, and current bot role.
+- `/users [limit]` lists recently seen users for admins and the owner.
+- `/chats [limit]` lists recently seen group chats for admins and the owner.
+- `/setrole <user_id> <admin|user>` updates a registered user's role for the configured owner only.
 
 Any non-command private message receives a simple placeholder response. Replace that handler with your project-specific behavior.
 
